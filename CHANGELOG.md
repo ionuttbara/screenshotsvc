@@ -5,7 +5,166 @@ All notable changes to Nitshot. Versions before 0.8.0.0's rename were released a
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.8.6.7] - 2026-10-25
+
+### Added
+- **Tooltips on the snip toolbar's buttons** - Rectangle, Freeform, Window
+  and Whole screen with their keys (1-4), Record, and Cancel (Esc) - after
+  the pointer rests on one for half a second, and on the recording bar's
+  stop button. In English and German.
+
+### Fixed
+- The recording bar's stop button said "Stop" in every language.
+
+## [0.8.6.6] - 2026-10-25
+
+### Changed
+- **Intel: recordings start about a second sooner.** What the graphics card
+  can do is asked once per run instead of twice per recording, and lookahead
+  the runtime has refused once is not asked for again until Nitshot
+  restarts. (Confirmed on an Arc 140V with 0.8.6.5: every recording through
+  the card's own encoder, with B-frames; lookahead is refused there.)
+
+## [0.8.6.5] - 2026-10-23
+
+### Fixed
+- **Intel: lookahead no longer costs the card's own encoder.** On an Arc 140V
+  Intel's runtime refused to start with lookahead from system memory
+  (MFX_ERR_UNDEFINED_BEHAVIOR), and the recording fell back to Windows'
+  encoder. When the runtime refuses, Nitshot now tries again without
+  lookahead, then without B-frames as well.
+
+## [0.8.6.4] - 2026-10-23
+
+### Fixed
+- **AMD: the card's own encoder was never used.** AMF's pre-analysis takes
+  NV12 frames only, and Nitshot handed it BGRA (SDR) or P010 (HDR), so Init
+  failed every time and recordings quietly went through Windows' encoder
+  instead (found in a tester's log on a Radeon, driver 26.20). BGRA is now
+  converted to NV12 on the graphics card first, as on the Intel path; P010
+  is encoded without pre-analysis; and an encoder that still refuses its
+  configuration is tried once more without pre-analysis.
+
+## [0.8.6.3] - 2026-10-20
+
+### Changed
+- **Intel: frames go to the encoder in system memory**, read back from the
+  graphics card and uploaded by Intel's runtime on its own device - the way
+  Intel's samples feed an encoder. Handing over textures from Nitshot's own
+  allocator failed on an Arc 140V: with lookahead the program closed, without
+  it the runtime reported "device failed" on the first frame. The texture
+  path stays available as `RecordIntelVideoMemory=1` in settings.ini.
+
+### Fixed
+- **When the graphics card's own encoder fails before its first picture,
+  Nitshot records again straight away through Windows' encoder**, switches
+  the card's encoder off and says so - instead of a recording that did not
+  start.
+- After the card's encoder had failed, finishing the recording could hang
+  for good (closing Intel's runtime did not return), and no further
+  recording could start. Closing a failed encoder now gets 3 seconds.
+
+## [0.8.6.2] - 2026-10-20
+
+### Added
+- **A recording through the graphics card's own encoder is watched more
+  closely**, for deaths the crash report of 0.8.6.1 could not see: serious
+  exceptions are logged as they happen; a recording that stands still for
+  10 seconds is logged with a dump of every thread; the program leaving in
+  the middle of one is logged; and at the next start Windows' own record of
+  the crash or hang is copied into the log.
+
+## [0.8.6.1] - 2026-10-20
+
+### Added
+- **A crash leaves a report**: a line in the log - even with the diagnostic
+  log off - naming where it happened and what Nitshot was doing, and a small
+  crash dump beside it to send in.
+- **If Nitshot ends during a recording through the graphics card's own
+  encoder, it switches that encoder off at the next start** and says so, so
+  that recording works again straight away, through Windows' encoder.
+
+### Fixed
+- Recording on Intel Arc closed the program (first reported on an Arc 140V).
+  The cause is not yet known - this build records each step of the first
+  frames and the crash itself, to find it - but the picture the encoder
+  reads is now made the way the colour conversion was tested with, and the
+  encoder's surfaces say which memory they are, as oneVPL 2.x expects.
+
+## [0.8.6.0] - 2026-10-19
+
+### Added
+- **Intel Arc and Xe graphics record through the card's own encoder too
+  (oneVPL)**: B-frames, lookahead and HDR10 where the card offers them, with
+  the screen converted to the encoder's format on the GPU. **Not yet tried on
+  Intel hardware**; anything wrong falls back to Windows' encoder, and the
+  diagnostic log records in detail what the card answered. Older Intel GPUs
+  record as before.
+
+## [0.8.5.0] - 2026-10-19
+
+### Added
+- **AMD graphics cards record through the card's own encoder too (AMF)**,
+  as NVIDIA cards do through NVENC: B-frames for H.264 where the card has
+  them, pre-analysis as lookahead, and HDR10 with the monitor's colour
+  volume. **Not yet tried on AMD hardware**; if anything is wrong it falls
+  back to Windows' encoder, and the diagnostic log says in detail what the
+  card answered.
+
+### Changed
+- The setting is now *Use the graphics card's own encoder directly (NVIDIA,
+  AMD)*, and its INI keys are `RecordDirectEncoder` and `RecordEncoder*`;
+  the `RecordNvenc*` keys of 0.8.4.0 carry over.
+
+## [0.8.4.0] - 2026-10-19
+
+### Added
+- **On NVIDIA graphics cards, recordings go through the card's encoder
+  directly (NVENC)** instead of through Windows' video encoder, which on
+  NVIDIA cannot use B-frames or look ahead - both of which NVENC now does at
+  the same bitrate. Measured on screen-like content: a clearer picture in
+  every case, 0.5 to 3.8 dB, at the same file size or up to 11 % smaller.
+  H.264, HEVC and 10-bit HDR all work this way; HDR recordings also carry
+  the monitor's colour volume inside the video stream. Without an NVIDIA
+  card, or with an older driver, recordings work as before. *Use the NVIDIA
+  encoder directly* in the Recording settings switches it off; quality
+  preset, B-frames and lookahead are in the INI.
+
+## [0.8.3.0] - 2026-10-19
+
+### Added
+- **Record the sound of any sound device**, not just the default speakers or
+  microphone: every playback device (recorded as what it plays) and every
+  recording device is listed by name in the settings. The two default entries
+  remain and follow Windows' current default. An existing setting carries over.
+  If the chosen device is unplugged, the video is recorded without it and the
+  notification says why.
+- **A second sound source**, recorded as a second sound track in the MP4 - or,
+  with *Mix both into one track*, mixed with the first into a single track.
+  Each source keeps its own timing, so neither drifts against the video.
+- With the lossless WAV option and two sources, one WAV per source
+  (`.track1.wav`, `.track2.wav`), plus `.track0.wav` with the mix when mixing.
+  Building the MP4's sound from the WAVs works with two tracks too.
+- Sound tracks are named after their device, so a player's track menu shows
+  which is which.
+- *…but keep each source's .wav when mixing*: when two mixed sources are built
+  into the MP4 from their WAVs, each source's own WAV can be kept.
+- After 5 minutes without a snip, the capture machinery is released entirely,
+  bringing idle memory down to about 17 MB; the next snip takes about 0.1 s
+  longer, once. `IdleReleaseMinutes` in the INI changes the delay (0 = never).
+
+### Changed
+- Sound is now always recorded at 48 kHz stereo, with Windows converting from
+  whatever the device runs at. Devices at 96 or 192 kHz, which were refused
+  before, now work, and surround devices are mixed down to stereo by Windows
+  instead of keeping only the front pair.
+- H.264 recordings use the High profile instead of Baseline: better picture at
+  the same bitrate, and playable everywhere H.264 is.
+- The encoder test made on first start now reads back what each encoder
+  actually wrote. An encoder that quietly writes 8-bit when asked for 10-bit
+  HDR - NVIDIA's does exactly that when asked for 12-bit - is no longer
+  offered, so an "HDR" recording cannot turn out to be 8-bit. The encoders are
+  tested once more after the update.
 
 ### Fixed
 - **Memory no longer piles up while the program waits.** After a snip, the
@@ -16,11 +175,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   few seconds after each snip, and capture rebuilds trim before they release.
   Idle memory after a snip: 115 MB → 53 MB, with snips exactly as fast as
   before.
-
-### Added
-- After 5 minutes without a snip, the capture machinery is released entirely,
-  bringing idle memory down to about 17 MB; the next snip takes about 0.1 s
-  longer, once. `IdleReleaseMinutes` in the INI changes the delay (0 = never).
 
 ## [0.8.2.0] - 2026-10-10
 

@@ -1,7 +1,7 @@
 # Nitshot
 
-**Version 0.8.2.0**
-Copyright © 2026 Rekow IT
+**Version 0.8.6.7**
+Copyright © 2026 Rekow IT · Licensed under the [GNU GPL, version 3](LICENSE)
 
 A small native Win32 replacement for the Windows 10 Snipping Tool: a tray-resident
 C17 program with no runtime dependencies that takes over `Win+Shift+S` and `PrtScn`,
@@ -23,7 +23,7 @@ to `Pictures\Nitshot`.
 |---|---|
 | Capture | rectangle, freeform, window, full screen — over a frozen, dimmed desktop |
 | HDR stills | fp16 capture, JPEG XR, tone-mapped PNG beside it |
-| Recording | MP4 with system sound or microphone, optional lossless WAV |
+| Recording | MP4 with the sound of any playback or recording device, optional lossless WAV |
 | HDR recording | 10-bit BT.2020 PQ, HEVC Main10, encoder chosen by probing |
 | Destinations | clipboard and disk in one step |
 | Interface | tray icon, settings window, light/dark, English and German |
@@ -214,10 +214,40 @@ Verified by decoding a recording back: 960×540 at exactly 30.0 fps, 168 frames 
 5.567 s, with the audio timeline matching the video to within a millisecond, and a
 captured test tone coming back at 5838 against the 6000 it was played at.
 
-- **Sound** is one source at a time: the speakers (a WASAPI loopback of the default
-  playback device) or the microphone. Mixing both would mean resampling and
-  drift-correcting between two independent clocks, which is a bigger job than it
-  looks and is left out.
+- **Sound** comes from any active endpoint: a playback device is recorded as what
+  it plays (a WASAPI loopback of that endpoint), a recording device directly. Two
+  entries follow whatever Windows currently has as its default playback and
+  recording device. The INI stores the endpoint id, so the choice survives the
+  device being renamed or moved to another USB port; a device that is unplugged
+  when a recording starts is skipped, and the notification says so.
+- **A second source** can be recorded alongside, either as a **second AAC track**
+  in the MP4 or **mixed with the first into one track**. Each source runs on its
+  own device clock, so each keeps its own timeline - counted in the samples it
+  delivered - and its own silence padding; the two never share a timestamp
+  base, and a source that pauses does not shift the other. The two tracks of a
+  4-second test recording came out 3.78 and 3.80 s against 3.80 s of video.
+- **Mixing** sums each source into a 4-second ring at *its own* timeline
+  position, and hands the mix on only up to where both have arrived. Summing
+  packets as they come would put one device's sound against the wrong instant
+  of the other's, since the two deliver at their own moments in packets of
+  their own size. A source that goes quiet is padded like any other, so the mix
+  never waits on it for long; one that stalls a whole ring behind has its share
+  of the oldest stretch dropped rather than holding everything up. The sum is
+  clamped, not halved - attenuating both would put a voice over quiet game
+  sound at half its level to guard against a clip that needs both loud at
+  once. `rectest a` checks the mixer sample by sample: out-of-step packets,
+  a padded stretch, and a clipping pair.
+- Each audio track is **named after its device** - in `mdia/hdlr` (what
+  ffmpeg, LAV and MPC show) and in `udta/name` (what VLC shows) - so a player's
+  track menu says *Microphon*, or *A + B* for a mix. Written the
+  same way as the colour boxes: only into a `moov` that is the file's last box.
+- Every stream is opened at **48 kHz stereo float with
+  `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`**, so the audio engine resamples and folds
+  the channels down - a 96 kHz interface, a 5.1 headset and a mono microphone all
+  arrive in the same format, which is what AAC wants and what lets tracks sit
+  side by side. Only if the engine refuses is the endpoint's own mix format used,
+  as before, and then only at 44.1 or 48 kHz. Checked on six devices with
+  `rectest a`: all delivered 48 kHz stereo, within 0.6 % of nominal over 2 s.
 - A loopback capture delivers *nothing at all* while the machine is silent - not
   zeroed packets, no packets. The video loop therefore tops the audio timeline up
   with real silence whenever it falls behind, or a recording of a quiet desktop
@@ -253,8 +283,14 @@ captured test tone coming back at 5838 against the 6000 it was played at.
   no timeline to pad — so that whole class of live-timing fault cannot arise, and
   the WAV is the authoritative copy. It cost 15–47 ms on the recordings tested.
 
+  With two sources the sidecars are `<video>.track1.wav` and `.track2.wav`, one
+  per source, plus `.track0.wav` holding the mix when the two are mixed; the
+  MP4's tracks are then built from track1/track2, or from track0.
+
   With this on the `.wav` is an **intermediate and is deleted** once its sound is
-  in the MP4. Keeping it looked tidy and was not: players that auto-load a
+  in the MP4 - with two sources, all of them, unless the two were mixed and
+  `RecordKeepSourceWavs` asks for each source's own WAV to stay (the mix's
+  `.track0.wav` goes either way: its sound is the MP4's). Keeping it looked tidy and was not: players that auto-load a
   same-named sidecar — MPC does — then offer the same audio twice, as two
   selectable tracks. If the mux fails the `.wav` is kept, because at that point
   it is the only place the sound still exists.
@@ -370,6 +406,194 @@ captured test tone coming back at 5838 against the 6000 it was played at.
   and HEVC Main10, all on hardware, in 454 ms — cached in the INI against the
   adapter and its driver version, and re-probed only when either changes.
 
+- **The probe reads its file back.** Finalising proves that *a* file came out,
+  not that it is the one asked for: NVIDIA's HEVC encoder accepts
+  `eAVEncH265VProfile_Main_420_12` without complaint, takes P016 or fp16 input,
+  and writes **8-bit Main**. So each probe file's codec configuration record is
+  read - `hvcC` profile and `bitDepthLumaMinus8`, or the `avcC` profile - and an
+  encoder whose file is not the depth and profile requested is not offered.
+  Nothing on this machine fails it today; it is there for the Intel and AMD
+  encoders this has not been run on, and it is the check any 12-bit mode would
+  have to pass. `rectest e` checks the parser, the Main 12 request (it comes
+  back profile 1, 8-bit) and a real HDR recording (profile 2, 10-bit).
+
+  **12-bit, for the record:** the capture is fp16, so the precision exists, but
+  no Media Foundation encoder here writes 12-bit HEVC or AV1, Windows ships no
+  software HEVC encoder, and a 10-bit panel (`IDXGIOutput6::GetDesc1` reports
+  `BitsPerColor` 10 here) could not show the difference. Not offered.
+
+- **H.264 is asked for the High profile.** Without a profile on the output type
+  the NVIDIA encoder writes Baseline, which has neither CABAC nor the 8×8
+  transform and so spends more bits on the same picture. The probe reads the
+  profile back too, and logs it if an encoder answers with another - still
+  8-bit, still playable, so that alone does not drop it.
+
+- **No B-frames on NVIDIA, and none to be had through Media Foundation.** The
+  NVIDIA H.264 and HEVC MFTs answer `ICodecAPI::IsSupported` for
+  `CODECAPI_AVEncMPVDefaultBPictureCount` with `E_NOTIMPL` and `SetValue` with
+  `E_INVALIDARG` - while rate control, GOP size and low latency are supported,
+  so the interface itself works - and the same value passed as encoding
+  parameters to `SetInputMediaType` is accepted and ignored: byte-identical
+  files, all P-frames. Only NVENC's own API gets them - see below. Microsoft's
+  software H.264 encoder writes B-frames by default (42 of 90 frames), and
+  other vendors' encoders may too, so the remux path is tested with them:
+  `rectest` copies a B-frame video through and requires every sample, byte and
+  timestamp to come out identical (60 samples, 29 stored out of display order).
+
+- **On NVIDIA, NVENC encodes directly** (`RecordDirectEncoder`, on by
+  default; `nvenc.c` behind `hwenc.h`, which the AMD path shares - see below). The driver's `nvEncodeAPI64.dll` is loaded from System32 at run
+  time - nothing is linked - and needs API 12.1, drivers from 531 on. NVENC
+  gets the frames where the zero-copy path has them: the BGRA capture or the
+  tone-mapped BGRA of an HDR desktop (NVENC converts both as BT.709, measured:
+  2.6 levels off over four colour patches, against 64 for BT.601), or P010
+  rendered into a texture of its own. Each frame is copied on the GPU into a
+  texture NVENC owns, because with B-frames and lookahead it holds its inputs
+  for a while. The MP4 writer then only muxes: its video stream's input and
+  output type are the same compressed type, carrying NVENC's parameter sets.
+
+  Settings: preset P5 of P1..P7 with high-quality tuning
+  (`RecordEncoderPreset`), 2 B-frames for H.264 and 3 for HEVC, the HEVC ones
+  usable as references (`RecordEncoderBFrames`, -1 = that default), a 16-frame
+  lookahead (`RecordEncoderLookahead`), VBR at the same average bitrate the
+  Media Foundation encoder gets with twice that as the ceiling, and a key
+  frame every two seconds. Spatial adaptive quantisation is off
+  (`RecordEncoderAq`): it moves bits from busy areas to flat ones, and on a
+  screen the busy areas are the text - see the measurement below. HDR10 streams describe themselves as
+  BT.2020 / PQ / BT.2020 NCL, and each key frame carries a mastering-display
+  SEI; the light levels, known only at the end, stay in the container.
+
+  Where NVENC is missing, too old, on another adapter than the desktop (a
+  laptop running it on the integrated GPU) or refuses the configuration, the
+  recording goes through Media Foundation as before. If it stops mid-way, the
+  recording ends there and is kept, and the notification says so - a file's
+  encoder cannot be changed half-way through.
+
+  Two things the API leaves unsaid shaped `nvenc.c`. With lookahead, a
+  successful submission does not mean everything handed in is done: locking a
+  picture still held fails with `NV_ENC_ERR_INVALID_PARAM`, so pictures are
+  taken out only once they are more than B-frames + lookahead back. And the
+  list calls want count-then-fetch: asked for more than it has, the driver
+  answered with all-zero GUIDs.
+
+- **Timestamps with B-frames.** A B-frame is decoded after the anchor it
+  depends on but shown before it, so with presentation time = capture time
+  the first few decode times would have to be negative - and Media
+  Foundation's MP4 sink silently drops samples with a negative decode time;
+  it dropped the first key frame, and nothing up to the next one decoded.
+  Ramping the decode times up from zero in fractions of a frame kept them,
+  but made ffmpeg see a 120 fps stream and write every frame four times. So,
+  as Microsoft's own B-frame encoder does, every picture is presented later
+  by the reorder depth - 66.7 ms with 2 B-frames at 30 fps, 100 ms with 3 -
+  with every sample the same duration. Unlike Microsoft's encoder, which
+  leaves the sound a frame early, the recorder moves the sound by exactly
+  the same amount, live and when the sound is rebuilt from the WAV. Measured
+  on real recordings: picture and sound both start at 66.7 ms (H.264) and at
+  100.0 ms (HEVC).
+
+  `rectest n` records through the real recorder on every NVENC path - H.264
+  from an HDR desktop tone-mapped and from plain SDR capture, with the sound
+  rebuilt from the WAV, HEVC 8-bit, and HEVC Main10 from an HDR desktop -
+  and on the last checks the whole of the HDR signalling: Main10 10-bit with
+  B-frames, PQ in the stream, the container's mastering-display and
+  light-level boxes still written after NVENC's own, and one mastering SEI
+  per key frame.
+
+- **On AMD, AMF encodes directly** (`amfenc.c`, the same setting). The
+  driver's `amfrt64.dll` is loaded from System32 at run time and needs AMF
+  1.4.35 (headers in `third_party/amf`). The recorder picks the vendor by the
+  PCI vendor id of the adapter its capture device is on - 10DE NVIDIA, 1002
+  AMD, 8086 Intel - and everything else stays on Media Foundation.
+
+  **Not tested on AMD hardware** - there was none to test on. It follows
+  AMD's documentation and what ffmpeg and OBS do: the usage set first (it
+  resets every other property), quality preset and profile, the static
+  properties - frame size, rate, B-frames, IDR period, colour description -
+  before `Init`, bitrates after. What the chip offers is asked for, not
+  assumed: B-frames only for H.264 and only where the encoder reports them
+  (`BFrames` capability; SDK 1.4.35 has none for HEVC), pre-analysis as the
+  lookahead where reported, HEVC Main10 where the maximum profile allows.
+  Rate control is peak-constrained VBR like NVENC's; VBAQ and pre-analysis'
+  perceptual AQ stay off for the same reason AQ does there. Presets 1-3 map
+  to AMF's speed, 4-5 to balanced, 6-7 to quality. Each frame is copied on
+  the GPU into a surface from AMF's own pool, so nothing of the recorder's is
+  held while the encoder works. The parameter sets come from the encoder's
+  extradata, unpacked to Annex-B if it is a configuration record (tested in
+  `rectest n` without hardware). HDR10 hands AMF the mastering display as
+  `AMFHDRMetadata`; the light levels stay in the container.
+
+  Since a user with an AMD card is the first to run this, it says a lot in
+  the diagnostic log: the runtime version, each capability, every property
+  set with AMF's result text where it was refused, `Init`, the extradata,
+  and AMF's own warnings and errors, routed into the log through an AMF trace
+  writer. A refusal of anything that matters - usage, profile, bit depth,
+  `Init`, the parameter sets - leaves the recording on Media Foundation; any
+  other refused property is logged and lived with.
+
+- **On Intel Arc and Xe, oneVPL encodes directly** (`qsvenc.c`, the same
+  setting). The GPU runtime, `libmfx64-gen.dll` with API 2.x, is not in
+  System32 but in the driver's DriverStore folder: it is found through the
+  `DriverStorePathForVPL` value of the driver key of the Intel display
+  adapter with the capture device's PCI device id - what Intel's dispatcher
+  reads - and loaded only if that folder is under `System32\DriverStore`
+  (`rectest n` checks that a path climbing out with `..` is refused). Older
+  Intel GPUs have only the legacy Media SDK runtime and stay on Media
+  Foundation. Headers: oneVPL 2.13 in `third_party/vpl`.
+
+  **Tested on Intel hardware**. It follows Intel's samples and
+  what OBS does with Quick Sync: a session on the hardware implementation
+  whose device id matches (every implementation the runtime offers is
+  logged), the recorder's D3D11 device handed over, and a **frame allocator
+  of Nitshot's own** - D3D11 texture arrays for decoder-target requests,
+  single textures for processor and encoder targets, staging buffers for P8
+  bitstream "frames" - so Nitshot always knows which texture and slice each
+  surface is and copies each frame there on the GPU. oneVPL's D3D11 surface
+  import would be simpler and is still experimental in 2.17, so it is not
+  used; the internal surfaces' `GetNativeHandle` gives a texture but no slice.
+  The configuration is queried first and every field the runtime changed is
+  logged, then initialised, then read back: the B-frame delay is taken from
+  what the encoder actually uses. Target usage 1-7 is the reverse of the
+  preset; VBR, a 2 s closed GOP, B-pyramid, `LookAheadDepth`, MBBRC (Intel's
+  AQ) off, the BT.709 or BT.2020/PQ colour description, and for HDR10 the
+  mastering display in Annex D order. Intel's 90 kHz stamps are mapped back to
+  the exact input times rather than converted.
+
+- **BGRA to NV12 on the GPU** (`vpconv.c`), for encoders that do not take RGB
+  - Intel's, depending on the generation: the D3D11 video processor, which
+  every driver has, with the DXGI colour spaces set to full-range RGB in and
+  BT.709 limited range out, and the driver's own processing switched off.
+  Measured here: six colour patches within one level of BT.709 (2.6 over all
+  of them), against 64 for BT.601.
+
+- **Measured against Media Foundation** (`rectest q`): 150 frames of
+  screen-like 1280x720 content - a page of text scrolling, a window dragged
+  across it, a small grainy video, a smooth background - fed as identical NV12
+  to both encoders at the same average bitrate, Nitshot's default and half of
+  it, and compared with the source by ffmpeg's SSIM and PSNR on luma:
+
+  | Codec, bitrate | Encoder | Size | SSIM-Y | PSNR-Y |
+  |---|---|---|---|---|
+  | H.264, 3317 kbit/s | Media Foundation | 1995 KB | 0.9814 | 38.56 dB |
+  | | **NVENC** | 2007 KB | **0.9837** | **39.05 dB** |
+  | | NVENC with AQ | 2032 KB | 0.9852 | 37.52 dB |
+  | H.264, 1658 kbit/s | Media Foundation | 967 KB | 0.9692 | 33.44 dB |
+  | | **NVENC** | 919 KB | **0.9741** | **35.69 dB** |
+  | | NVENC with AQ | 932 KB | 0.9735 | 33.83 dB |
+  | HEVC, 2156 kbit/s | Media Foundation | 1239 KB | 0.9738 | 37.29 dB |
+  | | **NVENC** | 1179 KB | **0.9776** | **38.64 dB** |
+  | | NVENC with AQ | 1171 KB | 0.9780 | 37.54 dB |
+  | HEVC, 1078 kbit/s | Media Foundation | 665 KB | 0.9517 | 29.46 dB |
+  | | **NVENC** | 595 KB | **0.9665** | **33.26 dB** |
+  | | NVENC with AQ | 570 KB | 0.9645 | 31.39 dB |
+
+  NVENC as configured is better on both measures in every case, by 0.5 to
+  3.8 dB, and the files come out the same size or up to a tenth smaller; the
+  gain grows as the bitrate falls, which is where B-frames and lookahead
+  pay. AQ buys a little SSIM at the higher rates and costs 1.5 to 2 dB
+  everywhere, so it stays off. Encoder CPU time stays under a millisecond a
+  frame for both; NVENC's call takes 0.6 to 1.2 ms of the 33 ms frame, since
+  it waits for each picture where Media Foundation encodes on threads of its
+  own.
+
   Hardware encoding was already in use before any of this:
   `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS` makes Media Foundation route to
   whichever vendor MFT is installed — NVIDIA's, Intel's or AMD's.
@@ -465,6 +689,13 @@ DXGI Desktop Duplication, which has no such overlay.
 
 MSVC 2022 Build Tools, x64, `/W4 /WX`. Falls back to MinGW-w64 if MSVC is not present.
 
+The only third-party files are vendor headers, each with a README naming
+its source and checksums: `third_party/nvenc/nvEncodeAPI.h`, NVIDIA's NVENC
+API (MIT, from FFmpeg's nv-codec-headers, API 12.1), `third_party/amf`,
+AMD's AMF SDK headers (MIT, v1.4.35), and `third_party/vpl`, Intel's oneVPL
+API headers (MIT, v2.13.0). Nothing is linked against any of them - the
+drivers' DLLs are loaded at run time.
+
 ```
 tests\build.bat
 ```
@@ -493,6 +724,33 @@ desktop, so they are deleted afterwards.
 `rectest.exe g` checks that the zero-copy path's prerequisites exist on the
 machine: a video-capable device, render targets on the planes of P010 and NV12
 textures, and encoders that take GPU textures and still finalise a file.
+
+Further modes, each on its own:
+
+- `a` - sound: every device opened and its delivered rate measured, the mixer
+  checked sample by sample, and recordings in every combination of sources,
+  mixing, WAVs and rebuild-from-WAV, with track count, length and names;
+- `e` - encoders: the bit-depth reader, a Main 12 request seen through, the
+  forced probe, and real HDR and H.264 recordings read back;
+- `n` - NVENC: the driver found, its API version and what it can encode, and
+  the missing-driver and wrong-DLL paths; then moving test frames encoded
+  through it into an MP4 (H.264 with and without B-frames and lookahead,
+  HEVC with B-frames) and read back - every frame present, on its exact
+  time from zero, B-frames stored out of order, profile and depth, and luma
+  PSNR against the frames that went in where Windows can decode the codec -
+  and which colour matrix NVENC applies to BGRA input; and HDR10 from P010:
+  Main10, BT.2020/PQ, a mastering-display SEI on each key frame with the
+  values asked for, constant 30 fps, and 10-bit PSNR. The last two need
+  `ffprobe`/`ffmpeg` on PATH (Windows 10 has no HEVC decoder of its own
+  without the paid HEVC Video Extensions) and are reported as unchecked
+  without them;
+- `q` - NVENC against Media Foundation: the same screen-like frames through
+  both at the same bitrates, SSIM and PSNR by ffmpeg, size and time; needs
+  `ffmpeg` on PATH;
+- `u` - the settings dialog: a screenshot of the Recording tab and the refusal
+  of one device in both sound lists.
+
+`e` and `u` write to `settings.ini` on the way and put it back byte for byte.
 
 It needs a desktop that is awake - a sleeping display hands Desktop Duplication
 no frames at all, and the recording check then fails for want of anything to
@@ -589,14 +847,26 @@ defaults on first run.
 | `HdrJxrQuality` | 90 | 1–100; 100 is true lossless and much slower |
 | `ForceSdr` | 0 | ignore advanced colour and capture 8-bit |
 | `IdleReleaseMinutes` | 5 | minutes without a snip before the capture machinery is released entirely (0 = keep it warm); the next snip then takes about 0.1 s longer, once |
-| `RecordAudio` | 1 | 0 none, 1 system sound, 2 microphone |
+| `RecordAudioDevice` | `default-playback` | `none`, `default-playback`, `default-input`, or an endpoint id; an older `RecordAudio=0/1/2` is converted |
+| `RecordAudioName` | | the device's name when it was chosen, shown while it is unplugged |
+| `RecordAudio2Device` | `none` | the second source, same values |
+| `RecordAudio2Name` | | as `RecordAudioName`, for the second source |
+| `RecordAudioMix` | 0 | mix the two sources into one track instead of recording two |
 | `RecordFps` | 30 | 5–60 |
 | `RecordRawAudio` | 1 | ask the endpoint to bypass its effects; many drivers refuse |
 | `RecordEncoder` | `auto` | `auto`, `h264`, `hevc8` or `hevc10`; only what probes clean is offered |
 | `RecordHdr` | 1 | capture 10-bit HDR when the display is in it |
 | `RecordWavSidecar` | 0 | also write the untouched PCM as a `.wav` beside the `.mp4` |
 | `RecordMuxFromWav` | 0 | with the above: no live AAC; build the `.mp4`'s sound from the `.wav` afterwards |
+| `RecordKeepSourceWavs` | 0 | with the above and two mixed sources: keep `.track1.wav` and `.track2.wav` |
 | `RecordZeroCopy` | 1 | frames stay on the GPU into the encoder; 0 forces the CPU path, for a driver that misbehaves |
+| `RecordDirectEncoder` | 1 | encode through the graphics card's own encoder API - NVENC on NVIDIA, AMF on AMD, oneVPL on Intel Arc/Xe; 0 = always Media Foundation |
+| `RecordEncoderPreset` | 5 | quality preset, 1 (fastest) .. 7 (best): NVENC's P1..P7; on AMD 1-3 speed, 4-5 balanced, 6-7 quality; on Intel target usage 7..1 |
+| `RecordEncoderBFrames` | -1 | B-frames, 0..5; -1 = 2 for H.264, 3 for HEVC; capped at what the GPU offers (AMD: H.264 only, up to 3; Intel: as the runtime accepts) |
+| `RecordEncoderLookahead` | 16 | frames the encoder looks ahead for its rate decisions, 0..32; 0 = off (AMD: pre-analysis; Intel: `LookAheadDepth`) |
+| `RecordEncoderAq` | 0 | spatial adaptive quantisation (AMD: VBAQ, Intel: MBBRC); off because it takes bits from text (measured: 1.5-2 dB less luma PSNR) |
+
+The `RecordNvenc*` keys of 0.8.4.0 are read once and replaced by these.
 | `SettingsX`, `SettingsY` | *unset* | where the settings window was dragged; unset means centred |
 | `Language` | `auto` | `auto` follows Windows; otherwise a tag with a `langs\<tag>.ini` |
 | `ForceGdi` | 0 | skip Desktop Duplication and always use GDI |
@@ -609,6 +879,44 @@ buffer to `overlay-debug.png` in the screenshots folder — a flip-model swap ch
 is invisible to every ordinary screen-capture route, `BitBlt` and `PrintWindow`
 both returning the desktop underneath it, so that dump is the only way to look at
 what the overlay actually rendered.
+
+## When it crashes
+
+`crash.c` installs an unhandled-exception filter at start. A crash writes a
+line into `Nitshot.log` - whether the diagnostic log is on or not - with the
+exception code, the module and offset it happened in, for an access
+violation the address and whether it was read or written, and the last
+step the code announced through `Crash_Step` before it died; and it saves a
+minidump (`crash-<date>-<time>.dmp`, about 100 KB: threads, stacks, modules)
+beside the log in `%APPDATA%\Nitshot`. The encoder paths announce their
+risky steps - the copy into the encoder's surface, the vendor runtime's
+encode and sync calls, the MP4 write - so a crash inside a vendor runtime
+names the call it was in.
+
+Not every death reaches that filter: a fail-fast, a heap a runtime finds
+corrupt, a runtime that installs its own filter, a hang, a runtime calling
+`ExitProcess`. So a recording through the card's own encoder is watched
+more closely. Serious first-chance exceptions are logged the moment they
+are raised (a vectored handler, ahead of anything a runtime installed).
+The filter is put back, and the fact logged, if the runtime replaced it.
+A watch thread logs a recording that has not moved for 10 seconds and
+writes `hang-<date>-<time>.dmp` of every thread. A TLS callback logs the
+process leaving through `ExitProcess` mid-recording. When the next start
+finds a recording that never ended, it copies Windows' own record of the
+crash or hang (Application Error 1000 / Application Hang 1002 in the
+Application event log, readable without admin rights) into the log; that
+record also catches what no handler inside the process can. These lines
+are written whether the diagnostic log is on or not (`Log_Always`).
+`rectest k` crashes, hangs and exits a child on purpose and checks each.
+
+A recording through the graphics card's own encoder also marks itself in
+the INI (`DirectRecordingRunning`) while it runs and clears the mark when it
+ends. A mark found at the next start means the process died mid-recording:
+`RecordDirectEncoder` is switched off - recording works again at once,
+through Media Foundation - and a notification says so, even with
+notifications switched off. For the AMD and Intel paths, which were written
+without the hardware, that turns a crash into one lost recording rather
+than a program that cannot record.
 
 ## A note on desktops
 
