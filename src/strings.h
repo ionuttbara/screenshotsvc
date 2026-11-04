@@ -55,6 +55,11 @@
   X(TOAST_RECORD_WAV,   "\nwith a lossless .wav beside it")                   \
   X(TOAST_RECORD_WAVS,  "\nwith %1 lossless .wav files beside it")            \
   X(WARN_AUDIO_MISSING, "Not recorded: %1 is not connected.")                 \
+  X(MSG_OTHER_RUNNING,  "Another copy of Nitshot is already running, from\n"  \
+                        "%1\n\nClose it and run this one instead?")          \
+  X(MSG_OTHER_STUCK,    "The other copy of Nitshot did not close. Please "    \
+                        "exit it from its tray icon and start this one "      \
+                        "again.")                                             \
   X(MSG_DIRECT_FAILED,  "The graphics card's own encoder (%1) failed at the " \
                         "start of the recording, so Nitshot recorded "       \
                         "through Windows' encoder and will keep doing so; "  \

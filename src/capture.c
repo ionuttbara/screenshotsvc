@@ -219,8 +219,15 @@ static BOOL RecreateDup(CapOutput *o)
      * DuplicateOutput1 is the only way to be handed the desktop in scRGB
      * half-float instead of the tone-mapped 8-bit version. It is also picky:
      * the process must be DPI-aware, which the manifest sees to.
+     *
+     * Only for the HDR outputs themselves. An SDR output next to an HDR one
+     * is read in 8-bit and lifted into the composite by SdrRowToScRgb: asked
+     * for float, a Radeon (driver 26.10) handed over its sRGB bytes without
+     * linearising them, and even correct values would have sat at 1.0 where
+     * the composite keeps SDR white at sdrWhiteNits / 80 - both washed out
+     * and dark once tone-mapped back.
      */
-    if (g_hdrMode && o->out5) {
+    if (g_hdrMode && o->out5 && o->hdr.active) {
         DXGI_FORMAT want = DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (SUCCEEDED(IDXGIOutput5_DuplicateOutput1(o->out5, (IUnknown *)o->dev,
                                                     0, 1, &want, &o->dup)))
@@ -314,6 +321,38 @@ static BOOL AcquireFrame(CapOutput *o, ID3D11Texture2D **tex)
     return FALSE;
 }
 
+/*
+ * An SDR output's 8-bit sRGB in an scRGB composite: linear light, scaled so
+ * that its white lands where the composite keeps SDR white (sdrWhiteNits, the
+ * HDR display's), which is what tone-mapping back to 8-bit maps to 255.
+ */
+static UINT16 g_sdrLut[256];
+static float  g_sdrLutNits = -1.0f;
+
+static void BuildSdrLut(float sdrWhiteNits)
+{
+    float scale = (sdrWhiteNits < 1.0f ? 80.0f : sdrWhiteNits) / 80.0f;
+    int   i;
+
+    if (sdrWhiteNits == g_sdrLutNits)
+        return;
+    for (i = 0; i < 256; i++) {
+        g_sdrLut[i] = Hdr_FloatToHalf(Hdr_SrgbToLinear((float)i / 255.0f) * scale);
+    }
+    g_sdrLutNits = sdrWhiteNits;
+}
+
+static void SdrRowToScRgb(UINT16 *dst, const BYTE *bgra, UINT32 w)
+{
+    UINT32 x;
+    for (x = 0; x < w; x++, bgra += 4, dst += 4) {
+        dst[0] = g_sdrLut[bgra[2]];
+        dst[1] = g_sdrLut[bgra[1]];
+        dst[2] = g_sdrLut[bgra[0]];
+        dst[3] = 0x3C00;                    /* 1.0: opaque */
+    }
+}
+
 /* Copy one output's frame into the virtual-desktop image at its own offset. */
 static BOOL BlitOutput(CapOutput *o, SnipImage *img, const RECT *vb)
 {
@@ -323,7 +362,7 @@ static BOOL BlitOutput(CapOutput *o, SnipImage *img, const RECT *vb)
     ID3D11Texture2D        *frame = NULL;
     LONG    dx, dy;
     UINT32  w, h, y;
-    BOOL    ok = FALSE;
+    BOOL    ok = FALSE, lift;
 
     if (!o->dup)
         return FALSE;
@@ -343,8 +382,9 @@ static BOOL BlitOutput(CapOutput *o, SnipImage *img, const RECT *vb)
     /* The frame must match what the composite image was allocated for; a
        mismatch means the display changed mode mid-grab, and the caller's
        wholesale fallback is the right answer. */
-    if (td.Format != (img->hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                               : DXGI_FORMAT_B8G8R8A8_UNORM))
+    lift = img->hdr && td.Format == DXGI_FORMAT_B8G8R8A8_UNORM && !o->hdr.active;
+    if (!lift && td.Format != (img->hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                        : DXGI_FORMAT_B8G8R8A8_UNORM))
         goto done;
     if (!EnsureStaging(o, &td))
         goto done;
@@ -366,11 +406,16 @@ static BOOL BlitOutput(CapOutput *o, SnipImage *img, const RECT *vb)
         goto done;
     }
 
+    if (lift)
+        BuildSdrLut(img->sdrWhiteNits);
     for (y = 0; y < h; y++) {
-        memcpy(img->pixels + (SIZE_T)(dy + (LONG)y) * img->stride
-                           + (SIZE_T)dx * img->bpp,
-               (const BYTE *)map.pData + (SIZE_T)y * map.RowPitch,
-               (SIZE_T)w * img->bpp);
+        BYTE       *dst = img->pixels + (SIZE_T)(dy + (LONG)y) * img->stride
+                                      + (SIZE_T)dx * img->bpp;
+        const BYTE *src = (const BYTE *)map.pData + (SIZE_T)y * map.RowPitch;
+        if (lift)
+            SdrRowToScRgb((UINT16 *)dst, src, w);
+        else
+            memcpy(dst, src, (SIZE_T)w * img->bpp);
     }
     ID3D11DeviceContext_Unmap(o->ctx, (ID3D11Resource *)o->staging, 0);
     ok = TRUE;

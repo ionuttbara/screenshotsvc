@@ -1,6 +1,6 @@
 # Nitshot
 
-**Version 0.8.6.8**
+**Version 0.8.6.10**
 Copyright © 2026 Rekow IT · Licensed under the [GNU GPL, version 3](LICENSE)
 
 A small native Win32 replacement for the Windows 10 Snipping Tool: a tray-resident

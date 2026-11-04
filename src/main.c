@@ -591,6 +591,49 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 /* The encoder a recording died in last time, for the message at start. */
 static wchar_t g_directCrashed[64];
+static BOOL    g_tookOver;          /* this copy replaced another program file */
+
+/*
+ * The running copy is another program file: asks whether to replace it, and
+ * if so ends it the way its own Exit menu item does (every version since
+ * recording handles IDM_EXIT the same) and waits for it. 1 replaced, 0 the
+ * same file (or the user said no: let it be), -1 asked but it stayed.
+ */
+static int TakeOver(HWND other)
+{
+    DWORD   pid = 0, n = MAX_PATH;
+    HANDLE  proc;
+    wchar_t mine[MAX_PATH], theirs[MAX_PATH], text[MAX_PATH + 256];
+    int     result = 0;
+
+    GetWindowThreadProcessId(other, &pid);
+    proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid) : NULL;
+    if (!proc)
+        return 0;
+    if (!GetModuleFileNameW(NULL, mine, MAX_PATH) ||
+        !QueryFullProcessImageNameW(proc, 0, theirs, &n) ||
+        lstrcmpiW(mine, theirs) == 0) {
+        CloseHandle(proc);
+        return 0;
+    }
+    /* Before Lang_Init has run, so the language the settings name. */
+    Settings_Load();
+    Lang_Init(g_cfg.language);
+    Lang_Format(text, ARRAYSIZE(text), STR_MSG_OTHER_RUNNING, theirs);
+    if (MessageBoxW(NULL, text, APP_TITLE_W, MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) == IDYES) {
+        PostMessageW(other, WM_COMMAND, IDM_EXIT, 0);
+        if (WaitForSingleObject(proc, 10000) == WAIT_OBJECT_0) {
+            result = 1;
+        } else {
+            MessageBoxW(NULL, Lang_Str(STR_MSG_OTHER_STUCK), APP_TITLE_W, MB_OK | MB_ICONWARNING);
+            result = -1;
+        }
+    } else {
+        result = -1;          /* said no: this copy simply does not start */
+    }
+    CloseHandle(proc);
+    return result;
+}
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 {
@@ -602,14 +645,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     UNREFERENCED_PARAMETER(cmdline);
     UNREFERENCED_PARAMETER(show);
 
-    /* A second copy is a request to capture, not a reason to run twice. */
+    /* A second copy is a request to capture, not a reason to run twice -
+       unless it is another program file, typically an update started while
+       the old version still sits in the tray (or in autostart). */
     mutex = CreateMutexW(NULL, TRUE, APP_MUTEX_W);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = FindWindowW(APP_CLASS_W, NULL);
-        if (other)
-            PostMessageW(other, WM_BSNIP_TRIGGER, TRIGGER_SECOND_INSTANCE, 0);
+        int  took = other ? TakeOver(other) : 0;
         CloseHandle(mutex);
-        return 0;
+        mutex = NULL;
+        if (took > 0)
+            mutex = CreateMutexW(NULL, TRUE, APP_MUTEX_W);
+        if (took == 0 && other)
+            PostMessageW(other, WM_BSNIP_TRIGGER, TRIGGER_SECOND_INSTANCE, 0);
+        if (took <= 0)
+            return 0;
+        g_tookOver = TRUE;
     }
 
     Crash_Install();
@@ -620,6 +671,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     Settings_Load();
     Log_Enable(g_cfg.debugLog);
     Log_Printf(L"---- start ----");
+    if (g_tookOver) {
+        /* The one the user chose to keep is the one to start with Windows. */
+        Log_Printf(L"start: replaced a copy running from another file");
+        if (Settings_GetAutostart())
+            Settings_SetAutostart(TRUE);
+    }
     {
         /* The last recording through the card's own encoder never ended:
            record through Windows' encoder from now on, and say so once the

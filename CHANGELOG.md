@@ -5,6 +5,26 @@ All notable changes to Nitshot. Versions before 0.8.0.0's rename were released a
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.6.10] - 2026-11-04
+
+### Fixed
+- **Washed-out, too dark screenshots of an SDR monitor while another monitor
+  is in HDR** (reported on a Radeon RX 7900 XTX). Every monitor was read as
+  HDR once one was; the SDR ones came back with their brightness levels
+  misread and their white at SDR's 80 nits instead of the HDR monitor's
+  SDR-white level. SDR monitors are now read as the 8-bit images they are and
+  placed into the HDR picture exactly, so their PNG matches the screen.
+
+## [0.8.6.9] - 2026-11-04
+
+### Fixed
+- **Starting a new version while an old one still ran did nothing.** Only
+  one copy of Nitshot runs at a time, so the new one quietly handed over to
+  the old one in the tray (or the one Windows had started at sign-in) - an
+  update seemed to change nothing. When the running copy is another program
+  file, Nitshot now asks whether to close it and run this one instead, and
+  "Start with Windows" then starts the one kept.
+
 ## [0.8.6.8] - 2026-11-04
 
 ### Fixed
