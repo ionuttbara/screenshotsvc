@@ -66,8 +66,8 @@
 #define APP_VER_MAJOR   0
 #define APP_VER_MINOR   8
 #define APP_VER_PATCH   6
-#define APP_VER_BUILD   7
-#define APP_VER_STRING  "0.8.6.7"
-#define APP_VER_WSTRING L"0.8.6.7"
+#define APP_VER_BUILD   8
+#define APP_VER_STRING  "0.8.6.8"
+#define APP_VER_WSTRING L"0.8.6.8"
 
 #endif /* NITSHOT_RESOURCE_H */

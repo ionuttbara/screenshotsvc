@@ -133,6 +133,7 @@ typedef struct {
                                             than it was captured - the sound
                                             is moved by the same            */
     BOOL                    hwFailed;
+    BOOL                    direct;      /* the card's encoder or nothing   */
     LONGLONG                hwPackets;   /* pictures the card's encoder gave */
     UINT                    mgrToken;
     ID3D11Multithread      *mt;
@@ -485,7 +486,15 @@ static BOOL ChooseEncoder(void)
         displayHdr = FALSE;      /* capture float, but write 8-bit */
 
     g_rec.enc = Encoder_Resolve(want, displayHdr);
-    if (g_rec.enc >= ENC_COUNT) {
+    g_rec.direct = FALSE;
+    if (g_rec.enc >= ENC_COUNT && g_rec.cfg.recordDirect) {
+        /* Media Foundation has nothing, but the card's own encoder needs
+           nothing from it except the MP4 writer: H.264 through that, or no
+           recording. Decided for good in SetupHwEncoder. */
+        Log_Printf(L"record: no Media Foundation encoder; trying the card's own for H.264");
+        g_rec.enc = ENC_H264;
+        g_rec.direct = TRUE;
+    } else if (g_rec.enc >= ENC_COUNT) {
         Log_Printf(L"record: no usable video encoder at all");
         return FALSE;
     }
@@ -579,7 +588,8 @@ static BOOL OpenWriter(void)
         return FALSE;
     IMFAttributes_SetGUID(attrs, &MF_TRANSCODE_CONTAINERTYPE,
                           &MFTranscodeContainerType_MPEG4);
-    IMFAttributes_SetUINT32(attrs, &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+    IMFAttributes_SetUINT32(attrs, &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+                            !Encoder_Caps()->softwareOnly[g_rec.enc]);
     /* Without this the writer blocks the capture loop to pace the encoder,
        which for a live screen recording means dropped frames instead. */
     IMFAttributes_SetUINT32(attrs, &MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
@@ -1050,6 +1060,9 @@ static void TeardownGpu(void)
 static BOOL SetupGpu(void)
 {
     if (!g_rec.devVideo || !g_rec.cfg.recordZeroCopy)
+        return FALSE;
+    /* Windows' software encoder takes frames in system memory. */
+    if (Encoder_Caps()->softwareOnly[g_rec.enc])
         return FALSE;
 
     if (FAILED(ID3D11DeviceContext_QueryInterface(g_rec.ctx, &IID_ID3D11Multithread,
@@ -1921,6 +1934,11 @@ static unsigned __stdcall RecordThread(void *arg)
                 goto done;
             }
         }
+    }
+    if (!g_rec.hw && g_rec.direct) {
+        Log_Printf(L"record: the card's own encoder is not available either");
+        Fail(Lang_Str(STR_ERR_NO_ENCODER));
+        goto done;
     }
     if (g_rec.hw) {
         Log_Printf(L"record: %s path, sound %lld ms later to match the picture",

@@ -5,6 +5,18 @@ All notable changes to Nitshot. Versions before 0.8.0.0's rename were released a
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.6.8] - 2026-11-04
+
+### Fixed
+- **"No video encoder is available" although the graphics card has one**
+  (reported on a Radeon RX 7900 XTX, driver 26.10.x, where the settings
+  offered only "Automatic"). The encoder check let Windows pick the card's
+  own encoder and gave up when that one failed; it now tries Windows'
+  software encoder next. And when Windows offers no encoder at all, the
+  card's own encoder (AMD, NVIDIA, Intel) still records H.264 - it needs
+  nothing from Windows but the MP4 writer. The encoder check runs again
+  once after the update.
+
 ## [0.8.6.7] - 2026-10-25
 
 ### Added

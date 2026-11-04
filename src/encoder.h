@@ -33,8 +33,16 @@ typedef struct {
     BOOL    probed;                 /* the probe has run at least once */
     BOOL    usable[ENC_COUNT];
     BOOL    hardware[ENC_COUNT];
+    /* Works only with hardware transforms switched off: the card's own
+       encoder MFT was offered first and failed, Windows' software one did
+       not. The writer has to be told the same when it records. */
+    BOOL    softwareOnly[ENC_COUNT];
     wchar_t mft[ENC_COUNT][96];     /* friendly name of the encoder that ran */
 } EncoderCaps;
+
+/* Tests only: 1 probes as if every hardware encoder MFT failed, 2 as if
+   the software ones failed too. */
+extern volatile LONG g_encoderNoHardware;
 
 /* The cached result. Never NULL; everything is FALSE before the first probe. */
 const EncoderCaps *Encoder_Caps(void);

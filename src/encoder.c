@@ -365,7 +365,9 @@ static BOOL CheckProbeFile(EncoderId id, const wchar_t *path)
  * admits it cannot mux it, and an encoder can accept a profile it then
  * quietly replaces with another.
  */
-static BOOL ProbeOne(EncoderId id, const wchar_t *dir)
+volatile LONG g_encoderNoHardware;
+
+static BOOL ProbeOne(EncoderId id, const wchar_t *dir, BOOL allowHw)
 {
     IMFSinkWriter *writer = NULL;
     IMFAttributes *attrs = NULL;
@@ -384,9 +386,13 @@ static BOOL ProbeOne(EncoderId id, const wchar_t *dir)
         return FALSE;
     IMFAttributes_SetGUID(attrs, &MF_TRANSCODE_CONTAINERTYPE,
                           &MFTranscodeContainerType_MPEG4);
-    IMFAttributes_SetUINT32(attrs, &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+    IMFAttributes_SetUINT32(attrs, &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, allowHw);
     IMFAttributes_SetUINT32(attrs, &MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
 
+    if ((allowHw && g_encoderNoHardware) || g_encoderNoHardware > 1) {
+        hr = E_FAIL;
+        goto done;
+    }
     hr = MFCreateSinkWriterFromURL(path, NULL, attrs, &writer);
     if (FAILED(hr)) goto done;
 
@@ -420,12 +426,14 @@ static BOOL ProbeOne(EncoderId id, const wchar_t *dir)
 
 done:
     if (ok)
-        Log_Printf(L"encoder: %s usable via %s%s", Encoder_Name(id),
+        Log_Printf(L"encoder: %s usable via %s%s%s", Encoder_Name(id),
                    g_caps.mft[id][0] ? g_caps.mft[id] : L"(unnamed)",
-                   g_caps.hardware[id] ? L" [hardware]" : L"");
+                   g_caps.hardware[id] ? L" [hardware]" : L"",
+                   allowHw ? L"" : L" (hardware transforms off)");
     else
-        Log_Printf(L"encoder: %s unusable, failed at %hs (0x%08lX)",
-                   Encoder_Name(id), stage, (unsigned long)hr);
+        Log_Printf(L"encoder: %s unusable%s, failed at %hs (0x%08lX)",
+                   Encoder_Name(id), allowHw ? L"" : L" in software too",
+                   stage, (unsigned long)hr);
 
     if (writer) IMFSinkWriter_Release(writer);
     if (attrs)  IMFAttributes_Release(attrs);
@@ -454,7 +462,7 @@ static void CacheKey(wchar_t *out, size_t cch)
            older probe - one that did not read its files back, or asked H.264
            for no profile - is not trusted. */
         if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &ad)))
-            StringCchPrintfW(out, cch, L"%s %08lX%08lX p3", ad.Description,
+            StringCchPrintfW(out, cch, L"%s %08lX%08lX p4", ad.Description,
                              (unsigned long)umd.HighPart,
                              (unsigned long)umd.LowPart);
         IDXGIAdapter1_Release(adapter);
@@ -485,6 +493,9 @@ static BOOL LoadCache(const wchar_t *key)
         StringCchPrintfW(name, ARRAYSIZE(name), L"%s.hw", Encoder_Token(id));
         g_caps.hardware[id] = GetPrivateProfileIntW(CACHE_SEC, name, 0,
                                                     Settings_IniPath()) != 0;
+        StringCchPrintfW(name, ARRAYSIZE(name), L"%s.sw", Encoder_Token(id));
+        g_caps.softwareOnly[id] = GetPrivateProfileIntW(CACHE_SEC, name, 0,
+                                                        Settings_IniPath()) != 0;
     }
     SetProbed();
     return TRUE;
@@ -507,6 +518,10 @@ static void SaveCache(const wchar_t *key)
         StringCchPrintfW(name, ARRAYSIZE(name), L"%s.hw", Encoder_Token(id));
         WritePrivateProfileStringW(CACHE_SEC, name,
                                    g_caps.hardware[id] ? L"1" : L"0",
+                                   Settings_IniPath());
+        StringCchPrintfW(name, ARRAYSIZE(name), L"%s.sw", Encoder_Token(id));
+        WritePrivateProfileStringW(CACHE_SEC, name,
+                                   g_caps.softwareOnly[id] ? L"1" : L"0",
                                    Settings_IniPath());
     }
 }
@@ -541,9 +556,20 @@ void Encoder_Probe(BOOL force)
     ZeroMemory(g_caps.usable, sizeof(g_caps.usable));
     ZeroMemory(g_caps.hardware, sizeof(g_caps.hardware));
     ZeroMemory(g_caps.mft, sizeof(g_caps.mft));
+    ZeroMemory(g_caps.softwareOnly, sizeof(g_caps.softwareOnly));
 
-    for (id = ENC_H264; id < ENC_COUNT; id++)
-        g_caps.usable[id] = ProbeOne(id, dir);
+    /* With hardware transforms on, the writer takes the card's encoder MFT
+       and does not fall back when that one fails - a Radeon RX 7900 XTX
+       (driver 26.10) probed nothing at all that way. Windows' own software
+       encoder is asked for next, so that there is always something. */
+    for (id = ENC_H264; id < ENC_COUNT; id++) {
+        g_caps.usable[id] = ProbeOne(id, dir, TRUE);
+        if (!g_caps.usable[id]) {
+            g_caps.mft[id][0] = 0;
+            g_caps.hardware[id] = FALSE;
+            g_caps.usable[id] = g_caps.softwareOnly[id] = ProbeOne(id, dir, FALSE);
+        }
+    }
 
     SetProbed();
     SaveCache(key);

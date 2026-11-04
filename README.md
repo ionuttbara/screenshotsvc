@@ -1,6 +1,6 @@
 # Nitshot
 
-**Version 0.8.6.7**
+**Version 0.8.6.8**
 Copyright © 2026 Rekow IT · Licensed under the [GNU GPL, version 3](LICENSE)
 
 A small native Win32 replacement for the Windows 10 Snipping Tool: a tray-resident
@@ -239,7 +239,7 @@ captured test tone coming back at 5838 against the 6000 it was played at.
   a padded stretch, and a clipping pair.
 - Each audio track is **named after its device** - in `mdia/hdlr` (what
   ffmpeg, LAV and MPC show) and in `udta/name` (what VLC shows) - so a player's
-  track menu says *Microphon*, or *A + B* for a mix. Written the
+  track menu says *Mikrofon (EPOS GSX 300)*, or *A + B* for a mix. Written the
   same way as the colour boxes: only into a `moov` that is the file's last box.
 - Every stream is opened at **48 kHz stereo float with
   `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`**, so the audio engine resamples and folds
@@ -539,7 +539,7 @@ captured test tone coming back at 5838 against the 6000 it was played at.
   Intel GPUs have only the legacy Media SDK runtime and stay on Media
   Foundation. Headers: oneVPL 2.13 in `third_party/vpl`.
 
-  **Tested on Intel hardware**. It follows Intel's samples and
+  **Not tested on Intel hardware** either. It follows Intel's samples and
   what OBS does with Quick Sync: a session on the hardware implementation
   whose device id matches (every implementation the runtime offers is
   logged), the recorder's D3D11 device handed over, and a **frame allocator
