@@ -1,0 +1,21 @@
+RECUPERARE MULTITRACK MP4
+========================
+
+La pornire, scanarea sincrona nu deschide videoclipurile partiale. Un worker
+cu prioritate redusa cauta perechi *.recovered.mic.raw /
+*.recovered.system.raw si metadatele lor *.recovered.*.meta.
+
+Workerul nu mai presupune ca exista deja <nume>.mp4 sau un WAV combinat.
+Asociaza explicit <nume>.partial.mp4, calculeaza durata din capatul cel mai
+tarziu al celor doua fluxuri RAW folosind origin100ns si frecventa fiecarei
+piste, reconstruieste WAV-ul combinat la 48 kHz, adauga AAC daca MP4-ul nu
+contine deja audio, encodeaza cele doua piste FLAC si le adauga in container.
+
+MP4-ul partial este promovat numai daca structura top-level ftyp/moov/mdat
+este completa si Media Foundation poate citi un sample video. Daca lipseste
+moov sau sample-ul nu poate fi citit, fisierul partial ramane byte-cu-byte
+neschimbat si logul precizeaza motivul. Nu se poate reconstrui in siguranta
+video dintr-un mdat fara sample table/codec configuration prin aceasta cale.
+
+Sursele RAW si metadatele originale sunt pastrate. WAV-urile recuperate
+individual raman disponibile. MultiTrack ramane activ implicit.

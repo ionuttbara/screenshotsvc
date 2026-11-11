@@ -1,0 +1,30 @@
+#include <windows.h>
+#define IDI_CLASSIC 101
+IDI_CLASSIC ICON "ScreenshotServiceClassic.ico"
+1 VERSIONINFO
+ FILEVERSION 0,8,2,0
+ PRODUCTVERSION 0,8,2,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "ScreenshotService Project\0"
+      VALUE "FileDescription", "ScreenshotService Classic - Legacy screen capture\0"
+      VALUE "FileVersion", "0.8.2.0\0"
+      VALUE "InternalName", "ScreenshotServiceClassic\0"
+      VALUE "OriginalFilename", "ScreenshotServiceClassic.exe\0"
+      VALUE "ProductName", "ScreenshotService Classic\0"
+      VALUE "ProductVersion", "0.8.2.0\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

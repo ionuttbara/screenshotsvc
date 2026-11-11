@@ -1,0 +1,46 @@
+SCREENSHOTSERVICE - RECOVERY / CRASH HOTFIX
+
+Ce arata logul primit:
+- Aplicatia se opreste cu exceptia Windows 0xC00000FD (STATUS_STACK_OVERFLOW),
+  imediat dupa ce scanarea de recuperare incepe sa proceseze artefactele audio RAW.
+- Calea RAW-to-WAV avea un buffer local de 1 MiB. Acesta poate epuiza stiva
+  thread-ului Windows in timpul scanarii de pornire. Bufferul este acum alocat
+  pe heap si eliberat pe toate iesirile functiei.
+- La o inregistrare de aproximativ 17 minute, muxerul refuza adaugarea pistelor
+  FLAC deoarece atomul mdat depasea limita de 4 GiB a formatului pe 32 de biti.
+  Muxerul poate acum promova mdat la largesize pe 64 de biti si rebaza offset-urile
+  stco/co64 existente. Daca structura nu poate fi actualizata in siguranta, pastreaza
+  MP4-ul initial si nu il suprascrie cu un rezultat incomplet.
+- Watchdog-ul de 20 s era mentinut activ in timpul mixarii/encodarii audio offline.
+  Acum este oprit imediat dupa bucla de capturare live, inainte de procesarea Stop.
+
+Ce face aceasta versiune:
+- Nu deschide, nu parseaza si nu decodeaza fisierele .partial.mp4 la pornire.
+  Videoclipurile intrerupte raman byte-cu-byte intacte pentru recuperare izolata.
+- Recuperarea WAV, RAW, FLAC si GIF ramane disponibila; bufferul RAW de 1 MiB
+  nu mai ocupa stiva thread-ului.
+- Muxarea MP4 suporta promovarea mdat la largesize atunci cand pista AAC + cele
+  doua piste FLAC depasesc 4 GiB, in conditiile in care tabelele de chunk offset
+  pot fi validate si rebazate in siguranta.
+- MultiTrack ramane activ implicit (RecordMultiTrack = TRUE). Nu se modifica
+  preferinta salvata a utilizatorului.
+
+Limitari si siguranta datelor:
+- Fisierele RAW vechi fara sidecar-ul .meta nu contin singure informatii suficiente
+  pentru a deduce sigur rata de esantionare, numarul de canale si formatul PCM.
+  Aceste fisiere sunt pastrate nemodificate; nu se ghiceste formatul.
+- Fisierele .partial.mp4 nu sunt recuperate automat la pornire. Recuperarea video
+  trebuie rulata separat, intr-un proces izolat.
+- Daca muxerul intalneste o structura MP4 neacceptata, pastreaza MP4-ul initial si
+  sidecar-urile RAW/FLAC pentru recuperare ulterioara.
+
+Build si testare:
+1. Faceti backup la folderul curent al proiectului.
+2. Extrageti arhiva peste o copie curata a proiectului.
+3. Din Developer Command Prompt for VS 2022 rulati build.bat.
+4. Faceti o inregistrare de test, apoi una lunga care depaseste 4 GiB doar daca
+   discul are spatiu suficient.
+
+Validarea din acest mediu este statica; compilarea MSVC si testul pe Windows
+nu au putut fi executate aici. Nu stergeti manual fisierele .partial.*, .raw
+sau .meta pana cand recuperarea nu este confirmata.

@@ -1,0 +1,877 @@
+/*
+ * capture.c - DXGI Desktop Duplication with a GDI fallback.
+ */
+
+#define COBJMACROS
+
+#include "screenshotservice.h"
+#include "capture.h"
+#include "settings.h"
+#include "hdr.h"
+#include "log.h"
+
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <dxgi1_5.h>
+#include <dxgi1_3.h>      /* IDXGIDevice3::Trim */
+
+/* How long a grab may spend coaxing a frame out of one output before the
+   whole capture gives up and goes to GDI. A static desktop produces no new
+   frames at all, so the first acquire usually times out and we then rebuild
+   the duplication object - a fresh one always delivers the current desktop. */
+#define WARM_TRIES      3
+#define WARM_TIMEOUT_MS 20
+#define FRESH_TRIES     10
+#define FRESH_TIMEOUT_MS 30
+
+typedef struct {
+    ID3D11Device           *dev;
+    ID3D11DeviceContext    *ctx;
+    IDXGIOutput1           *out1;
+    IDXGIOutput5           *out5;     /* NULL before Windows 10 1803        */
+    IDXGIOutputDuplication *dup;
+    ID3D11Texture2D        *staging;
+    UINT32                  stgW, stgH;
+    RECT                    rect;      /* this output's desktop rectangle */
+    BOOL                    holding;   /* a frame is acquired and unreleased */
+    /*
+     * Whether this duplication has ever delivered an actual desktop image.
+     *
+     * AcquireNextFrame also succeeds for a frame that only reports the mouse
+     * pointer moving (LastPresentTime == 0). On a duplication that has handed
+     * over an image before, that surface still holds it. On a fresh one it
+     * holds nothing: every byte zero, black with zero alpha - which the
+     * overlay's premultiplied blending then draws as nothing at all, so the
+     * screen goes black and every selection rectangle stays behind as a trail.
+     * Under remote desktop the pointer is reported moving all the time, where
+     * 11 of 12 cold grabs came back this way.
+     */
+    BOOL                    hasImage;
+    HdrInfo                 hdr;
+} CapOutput;
+
+#define MAX_OUTPUTS 8
+
+static CapOutput     g_out[MAX_OUTPUTS];
+static int           g_outCount;
+static BOOL          g_inited;
+static BOOL          g_hdrMode;      /* duplicating in scRGB half-float       */
+static float         g_sdrWhiteNits = 80.0f;
+static const wchar_t *g_method = L"-";
+
+/* ------------------------------------------------------------ image utils */
+
+void Snip_FreeImage(SnipImage *img)
+{
+    if (!img)
+        return;
+    if (img->pixels)
+        HeapFree(GetProcessHeap(), 0, img->pixels);
+    if (img->sdr10Pixels)
+        HeapFree(GetProcessHeap(), 0, img->sdr10Pixels);
+    ZeroMemory(img, sizeof(*img));
+}
+
+BOOL Snip_AllocImage(SnipImage *img, UINT32 width, UINT32 height)
+{
+    return Snip_AllocImageEx(img, width, height, FALSE);
+}
+
+BOOL Snip_AllocImageEx(SnipImage *img, UINT32 width, UINT32 height, BOOL hdr)
+{
+    SIZE_T bytes;
+
+    ZeroMemory(img, sizeof(*img));
+    if (width == 0 || height == 0 || width > 65535 || height > 65535)
+        return FALSE;
+
+    img->width        = width;
+    img->height       = height;
+    img->bpp          = hdr ? 8u : 4u;
+    img->hdr          = hdr;
+    img->sdrWhiteNits = 80.0f;
+    img->stride       = width * img->bpp;
+    bytes = (SIZE_T)img->stride * height;
+
+    /* Zeroed, so gaps between monitors in the virtual desktop stay black
+       instead of showing whatever was in the heap. */
+    img->pixels = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes);
+    if (!img->pixels) {
+        ZeroMemory(img, sizeof(*img));
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL Snip_CropImage(const SnipImage *src, const RECT *rc, SnipImage *dst)
+{
+    LONG   l, t, r, b;
+    UINT32 y;
+
+    if (!src || !src->pixels || !rc || !dst)
+        return FALSE;
+
+    l = max(rc->left,   0);
+    t = max(rc->top,    0);
+    r = min(rc->right,  (LONG)src->width);
+    b = min(rc->bottom, (LONG)src->height);
+    if (r <= l || b <= t)
+        return FALSE;
+
+    if (!Snip_AllocImageEx(dst, (UINT32)(r - l), (UINT32)(b - t), src->hdr))
+        return FALSE;
+    dst->sdrWhiteNits = src->sdrWhiteNits;
+
+    for (y = 0; y < dst->height; y++) {
+        memcpy(dst->pixels + (SIZE_T)y * dst->stride,
+               src->pixels + (SIZE_T)(t + (LONG)y) * src->stride
+                           + (SIZE_T)l * src->bpp,
+               (SIZE_T)dst->width * src->bpp);
+    }
+    if (!src->hdr && src->sdr10Pixels && src->sdr10Valid) {
+        SIZE_T bytes = (SIZE_T)dst->width * 4u * dst->height;
+        dst->sdr10Pixels = (BYTE *)HeapAlloc(GetProcessHeap(), 0, bytes);
+        if (!dst->sdr10Pixels) {
+            Snip_FreeImage(dst);
+            return FALSE;
+        }
+        dst->sdr10Stride = dst->width * 4u;
+        dst->sdr10Valid = TRUE;
+        for (y = 0; y < dst->height; y++) {
+            memcpy(dst->sdr10Pixels + (SIZE_T)y * dst->sdr10Stride,
+                   src->sdr10Pixels + (SIZE_T)(t + (LONG)y) * src->sdr10Stride
+                                      + (SIZE_T)l * 4u,
+                   (SIZE_T)dst->width * 4u);
+        }
+    }
+    return TRUE;
+}
+
+/* --------------------------------------------------------- duplication */
+
+/*
+ * Hands the driver's spare memory for this device back to the system.
+ *
+ * Releasing a texture does not return its memory: the display driver keeps
+ * freed allocations - above all the large CPU-readable staging textures - in a
+ * cache of its own for reuse, even past the device's own release. Measured at
+ * 4K HDR that was 64 MB per capture rebuild, levelling off at about 130 MB that
+ * a program sitting idle in the tray had no use for. Trim is the call Windows
+ * provides for exactly this, for an app that is about to go quiet; it needs the
+ * context's state cleared first, or the bound resources stay pinned.
+ */
+static void TrimDevice(CapOutput *o)
+{
+    IDXGIDevice3 *d3 = NULL;
+
+    if (!o->dev)
+        return;
+    if (o->ctx) {
+        D3D11_QUERY_DESC qd;
+        ID3D11Query     *done = NULL;
+
+        ID3D11DeviceContext_ClearState(o->ctx);
+        /*
+         * A released texture is only really destroyed once the GPU has
+         * finished the work that used it, and Trim gives back only what is
+         * already gone - trimming straight after a grab found the staging
+         * texture still alive and returned nothing. Wait (briefly, bounded)
+         * for the GPU to drain first.
+         */
+        qd.Query     = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (SUCCEEDED(ID3D11Device_CreateQuery(o->dev, &qd, &done))) {
+            BOOL finished = FALSE;
+            int  waited;
+            ID3D11DeviceContext_End(o->ctx, (ID3D11Asynchronous *)done);
+            ID3D11DeviceContext_Flush(o->ctx);
+            for (waited = 0; waited < 200; waited++) {
+                if (ID3D11DeviceContext_GetData(o->ctx, (ID3D11Asynchronous *)done,
+                                                &finished, sizeof(finished), 0) == S_OK &&
+                    finished)
+                    break;
+                Sleep(1);
+            }
+            ID3D11Query_Release(done);
+        }
+        ID3D11DeviceContext_Flush(o->ctx);
+    }
+    if (SUCCEEDED(ID3D11Device_QueryInterface(o->dev, &IID_IDXGIDevice3, (void **)&d3))) {
+        IDXGIDevice3_Trim(d3);
+        IDXGIDevice3_Release(d3);
+    }
+}
+
+static void ReleaseOutput(CapOutput *o)
+{
+    if (o->holding && o->dup) {
+        IDXGIOutputDuplication_ReleaseFrame(o->dup);
+        o->holding = FALSE;
+    }
+    if (o->staging) { ID3D11Texture2D_Release(o->staging);        o->staging = NULL; }
+    if (o->dup)     { IDXGIOutputDuplication_Release(o->dup);     o->dup     = NULL; }
+    TrimDevice(o);
+    if (o->out5)    { IDXGIOutput5_Release(o->out5);              o->out5    = NULL; }
+    if (o->out1)    { IDXGIOutput1_Release(o->out1);              o->out1    = NULL; }
+    if (o->ctx)     { ID3D11DeviceContext_Release(o->ctx);        o->ctx     = NULL; }
+    if (o->dev)     { ID3D11Device_Release(o->dev);               o->dev     = NULL; }
+    o->stgW = o->stgH = 0;
+}
+
+static BOOL RecreateDup(CapOutput *o)
+{
+    /* A new duplication starts with an empty surface, whatever the old one had. */
+    o->hasImage = FALSE;
+    if (o->holding) {
+        IDXGIOutputDuplication_ReleaseFrame(o->dup);
+        o->holding = FALSE;
+    }
+    if (o->dup) {
+        IDXGIOutputDuplication_Release(o->dup);
+        o->dup = NULL;
+    }
+    if (!o->dev)
+        return FALSE;
+
+    /*
+     * DuplicateOutput1 is the only way to be handed the desktop in scRGB
+     * half-float instead of the tone-mapped 8-bit version. It is also picky:
+     * the process must be DPI-aware, which the manifest sees to.
+     */
+    if (o->out5) {
+        if (g_hdrMode) {
+            DXGI_FORMAT want = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            if (SUCCEEDED(IDXGIOutput5_DuplicateOutput1(o->out5, (IUnknown *)o->dev,
+                                                        0, 1, &want, &o->dup)))
+                return TRUE;
+            Log_Printf(L"capture: DuplicateOutput1(FLOAT) failed, using 8-bit fallback");
+        } else {
+            DXGI_FORMAT want[] = { DXGI_FORMAT_R10G10B10A2_UNORM,
+                                   DXGI_FORMAT_B8G8R8A8_UNORM };
+            if (SUCCEEDED(IDXGIOutput5_DuplicateOutput1(o->out5, (IUnknown *)o->dev,
+                                                        0, ARRAYSIZE(want), want, &o->dup)))
+                return TRUE;
+            Log_Printf(L"capture: DuplicateOutput1(10-bit SDR) failed, using BGRA8 fallback");
+        }
+    }
+    if (!o->out1)
+        return FALSE;
+    return SUCCEEDED(IDXGIOutput1_DuplicateOutput(o->out1, (IUnknown *)o->dev, &o->dup));
+}
+
+static BOOL EnsureStaging(CapOutput *o, const D3D11_TEXTURE2D_DESC *src)
+{
+    D3D11_TEXTURE2D_DESC d;
+
+    if (o->staging && o->stgW == src->Width && o->stgH == src->Height)
+        return TRUE;
+    if (o->staging) {
+        ID3D11Texture2D_Release(o->staging);
+        o->staging = NULL;
+    }
+
+    ZeroMemory(&d, sizeof(d));
+    d.Width          = src->Width;
+    d.Height         = src->Height;
+    d.MipLevels      = 1;
+    d.ArraySize      = 1;
+    d.Format         = src->Format;
+    d.SampleDesc.Count = 1;
+    d.Usage          = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    if (FAILED(ID3D11Device_CreateTexture2D(o->dev, &d, NULL, &o->staging))) {
+        o->staging = NULL;
+        return FALSE;
+    }
+    o->stgW = src->Width;
+    o->stgH = src->Height;
+    return TRUE;
+}
+
+static BOOL AcquireFrame(CapOutput *o, ID3D11Texture2D **tex)
+{
+    int attempt;
+
+    *tex = NULL;
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        int tries   = attempt == 0 ? WARM_TRIES   : FRESH_TRIES;
+        int timeout = attempt == 0 ? WARM_TIMEOUT_MS : FRESH_TIMEOUT_MS;
+        int i;
+
+        for (i = 0; i < tries; i++) {
+            DXGI_OUTDUPL_FRAME_INFO info;
+            IDXGIResource *res = NULL;
+            HRESULT hr;
+
+            if (o->holding) {
+                IDXGIOutputDuplication_ReleaseFrame(o->dup);
+                o->holding = FALSE;
+            }
+            hr = IDXGIOutputDuplication_AcquireNextFrame(o->dup, (UINT)timeout, &info, &res);
+            if (hr == DXGI_ERROR_WAIT_TIMEOUT)
+                continue;
+            if (FAILED(hr))
+                break;             /* access lost, or the mode changed */
+
+            o->holding = TRUE;
+
+            /* A pointer-only frame on a duplication that has never shown an
+               image carries nothing to capture; wait for one that does. See
+               CapOutput.hasImage. */
+            if (info.LastPresentTime.QuadPart != 0)
+                o->hasImage = TRUE;
+            else if (!o->hasImage) {
+                IDXGIResource_Release(res);
+                continue;
+            }
+
+            hr = IDXGIResource_QueryInterface(res, &IID_ID3D11Texture2D, (void **)tex);
+            IDXGIResource_Release(res);
+            if (SUCCEEDED(hr))
+                return TRUE;
+            break;
+        }
+
+        if (!RecreateDup(o))
+            return FALSE;
+    }
+    return FALSE;
+}
+
+/* Seed the optional high-precision image in WIC's packed BGR101010 layout.
+   The low 10 bits are red, the middle 10 green, and the high 10 blue. This is
+   only a seed: sdr10Valid becomes meaningful when a real DXGI 10-bit surface
+   is encountered; later 8-bit output regions are expanded only to complete the
+   composite image without claiming that those regions gained precision. */
+static BOOL EnsureSdr10Buffer(SnipImage *img)
+{
+    UINT32 x, y;
+    if (img->sdr10Pixels)
+        return TRUE;
+    img->sdr10Stride = img->width * 4u;
+    img->sdr10Pixels = (BYTE *)HeapAlloc(GetProcessHeap(), 0,
+        (SIZE_T)img->sdr10Stride * img->height);
+    if (!img->sdr10Pixels) {
+        img->sdr10Stride = 0;
+        return FALSE;
+    }
+    for (y = 0; y < img->height; y++) {
+        const BYTE *src = img->pixels + (SIZE_T)y * img->stride;
+        UINT32 *dst = (UINT32 *)(img->sdr10Pixels + (SIZE_T)y * img->sdr10Stride);
+        for (x = 0; x < img->width; x++) {
+            UINT32 b = ((UINT32)src[x * 4u + 0u] * 1023u + 127u) / 255u;
+            UINT32 g = ((UINT32)src[x * 4u + 1u] * 1023u + 127u) / 255u;
+            UINT32 r = ((UINT32)src[x * 4u + 2u] * 1023u + 127u) / 255u;
+            dst[x] = r | (g << 10) | (b << 20);
+        }
+    }
+    return TRUE;
+}
+
+static BYTE TenToEight(UINT32 v)
+{
+    return (BYTE)((v * 255u + 511u) / 1023u);
+}
+
+/* Copy one output's frame into the virtual-desktop image at its own offset. */
+static BOOL BlitOutput(CapOutput *o, SnipImage *img, const RECT *vb)
+{
+    DXGI_OUTDUPL_DESC       dd;
+    D3D11_TEXTURE2D_DESC    td;
+    D3D11_MAPPED_SUBRESOURCE map;
+    ID3D11Texture2D        *frame = NULL;
+    LONG    dx, dy;
+    UINT32  w, h, y;
+    BOOL    ok = FALSE;
+
+    if (!o->dup)
+        return FALSE;
+
+    IDXGIOutputDuplication_GetDesc(o->dup, &dd);
+    /* A rotated output hands out pixels in the panel's native orientation, not
+       the desktop's. Rather than transpose here, the whole capture drops to
+       GDI, which always reads desktop-oriented pixels. */
+    if (dd.Rotation != DXGI_MODE_ROTATION_IDENTITY &&
+        dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED)
+        return FALSE;
+
+    if (!AcquireFrame(o, &frame))
+        return FALSE;
+
+    ID3D11Texture2D_GetDesc(frame, &td);
+    /* Keep the source precision when the desktop duplication API exposes a
+       10-bit SDR surface. The BGRA8 view remains the preview/clipboard format;
+       sdr10Pixels is reserved for lossless JPEG XR output. */
+    if (img->hdr) {
+        if (td.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) goto done;
+    } else {
+        if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+            td.Format != DXGI_FORMAT_R10G10B10A2_UNORM) goto done;
+        if (td.Format == DXGI_FORMAT_R10G10B10A2_UNORM && !EnsureSdr10Buffer(img))
+            goto done;
+    }
+    if (!EnsureStaging(o, &td))
+        goto done;
+
+    ID3D11DeviceContext_CopyResource(o->ctx, (ID3D11Resource *)o->staging,
+                                     (ID3D11Resource *)frame);
+    if (FAILED(ID3D11DeviceContext_Map(o->ctx, (ID3D11Resource *)o->staging, 0,
+                                       D3D11_MAP_READ, 0, &map)))
+        goto done;
+
+    dx = o->rect.left - vb->left;
+    dy = o->rect.top  - vb->top;
+    w  = td.Width;
+    h  = td.Height;
+    if (dx < 0 || dy < 0 ||
+        (UINT32)dx + w > img->width || (UINT32)dy + h > img->height) {  /* NOLINT */
+        /* The desktop changed shape between the metrics call and now. */
+        ID3D11DeviceContext_Unmap(o->ctx, (ID3D11Resource *)o->staging, 0);
+        goto done;
+    }
+
+    for (y = 0; y < h; y++) {
+        const BYTE *srcRow = (const BYTE *)map.pData + (SIZE_T)y * map.RowPitch;
+        BYTE *dstRow = img->pixels + (SIZE_T)(dy + (LONG)y) * img->stride
+                                  + (SIZE_T)dx * img->bpp;
+        UINT32 x;
+        if (td.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            UINT32 *dst10 = (UINT32 *)(img->sdr10Pixels +
+                (SIZE_T)(dy + (LONG)y) * img->sdr10Stride + (SIZE_T)dx * 4u);
+            const UINT32 *src10 = (const UINT32 *)srcRow;
+            for (x = 0; x < w; x++) {
+                UINT32 v = src10[x];
+                /* DXGI R10G10B10A2 and WIC BGR101010 use opposite packed
+                   channel order. Read red from the high 10 bits and blue from
+                   the low 10 bits, then repack for WIC's JXR pixel format. */
+                UINT32 r = (v >> 20) & 0x3ffu;
+                UINT32 g = (v >> 10) & 0x3ffu;
+                UINT32 b = v & 0x3ffu;
+                dst10[x] = r | (g << 10) | (b << 20);
+                dstRow[x * 4u + 0u] = TenToEight(b);
+                dstRow[x * 4u + 1u] = TenToEight(g);
+                dstRow[x * 4u + 2u] = TenToEight(r);
+                dstRow[x * 4u + 3u] = 0xffu;
+            }
+            img->sdr10Valid = TRUE;
+            Log_Printf(L"capture: preserving DXGI R10G10B10A2 SDR source for JPEG XR");
+        } else {
+            /* HDR pixels are 8 bytes (RGBA16F); SDR pixels are 4 bytes (BGRA8). */
+            memcpy(dstRow, srcRow, (SIZE_T)w * img->bpp);
+            if (img->sdr10Pixels) {
+                UINT32 *dst10 = (UINT32 *)(img->sdr10Pixels +
+                    (SIZE_T)(dy + (LONG)y) * img->sdr10Stride + (SIZE_T)dx * 4u);
+                for (x = 0; x < w; x++) {
+                    UINT32 b = ((UINT32)srcRow[x * 4u + 0u] * 1023u + 127u) / 255u;
+                    UINT32 g = ((UINT32)srcRow[x * 4u + 1u] * 1023u + 127u) / 255u;
+                    UINT32 r = ((UINT32)srcRow[x * 4u + 2u] * 1023u + 127u) / 255u;
+                    /* WIC BGR101010 stores blue in the low 10 bits. */
+                    dst10[x] = b | (g << 10) | (r << 20);
+                }
+            }
+        }
+    }
+    ID3D11DeviceContext_Unmap(o->ctx, (ID3D11Resource *)o->staging, 0);
+    ok = TRUE;
+
+done:
+    if (frame)
+        ID3D11Texture2D_Release(frame);
+    if (o->holding) {
+        IDXGIOutputDuplication_ReleaseFrame(o->dup);
+        o->holding = FALSE;
+    }
+    return ok;
+}
+
+/* ---------------------------------------------------------- GDI fallback */
+
+static BOOL GrabViaGdi(SnipImage *img, const RECT *vb)
+{
+    HDC        screen, mem;
+    HBITMAP    dib, old;
+    BITMAPINFO bi;
+    void      *bits = NULL;
+    BOOL       ok = FALSE;
+    UINT32     y;
+    int        w = (int)img->width, h = (int)img->height;
+
+    screen = GetDC(NULL);
+    if (!screen)
+        return FALSE;
+    mem = CreateCompatibleDC(screen);
+    if (!mem) {
+        ReleaseDC(NULL, screen);
+        return FALSE;
+    }
+
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;          /* negative: top-down */
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (dib && bits) {
+        old = (HBITMAP)SelectObject(mem, dib);
+        /* CAPTUREBLT pulls in layered windows, which is what the user sees. */
+        if (BitBlt(mem, 0, 0, w, h, screen, vb->left, vb->top, SRCCOPY | CAPTUREBLT)) {
+            GdiFlush();
+            memcpy(img->pixels, bits, (SIZE_T)img->stride * img->height);
+            /* BitBlt leaves the alpha byte at zero; PNG and CF_DIBV5 both take
+               that literally, so force the image opaque - a word at a time,
+               which on a 4K desktop is the difference between a loop the
+               compiler can vectorise and 33 million byte stores. */
+            for (y = 0; y < img->height; y++) {
+                UINT32 *p = (UINT32 *)(img->pixels + (SIZE_T)y * img->stride);
+                UINT32  x;
+                for (x = 0; x < img->width; x++)
+                    p[x] |= 0xFF000000u;
+            }
+            ok = TRUE;
+        }
+        SelectObject(mem, old);
+    }
+    if (dib)
+        DeleteObject(dib);
+    DeleteDC(mem);
+    ReleaseDC(NULL, screen);
+    return ok;
+}
+
+/* ----------------------------------------------------------------- setup */
+
+BOOL Capture_Init(void)
+{
+    IDXGIFactory1 *factory = NULL;
+    UINT           ai;
+
+    if (g_inited)
+        return g_outCount > 0;
+    g_inited = TRUE;
+
+    /* Decided before any duplication object exists, because it picks their
+       pixel format: one HDR display puts the whole composite into scRGB. */
+    g_hdrMode      = !g_cfg.forceSdr && Hdr_AnyDisplayActive();
+    g_sdrWhiteNits = 80.0f;
+
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory)))
+        return FALSE;
+
+    for (ai = 0; g_outCount < MAX_OUTPUTS; ai++) {
+        IDXGIAdapter1 *adapter = NULL;
+        UINT oi;
+
+        if (IDXGIFactory1_EnumAdapters1(factory, ai, &adapter) == DXGI_ERROR_NOT_FOUND)
+            break;
+
+        for (oi = 0; g_outCount < MAX_OUTPUTS; oi++) {
+            IDXGIOutput    *output = NULL;
+            DXGI_OUTPUT_DESC od;
+            CapOutput      *o;
+            D3D_FEATURE_LEVEL got;
+
+            if (IDXGIAdapter1_EnumOutputs(adapter, oi, &output) == DXGI_ERROR_NOT_FOUND)
+                break;
+            if (FAILED(IDXGIOutput_GetDesc(output, &od)) || !od.AttachedToDesktop) {
+                IDXGIOutput_Release(output);
+                continue;
+            }
+
+            o = &g_out[g_outCount];
+            ZeroMemory(o, sizeof(*o));
+            o->rect = od.DesktopCoordinates;
+            Hdr_QueryMonitor(od.DeviceName, &o->hdr);
+            if (o->hdr.active)
+                g_sdrWhiteNits = o->hdr.sdrWhiteNits;
+
+            /* The device must live on the same adapter as the output, so this
+               is created per adapter rather than once globally. */
+            if (FAILED(D3D11CreateDevice((IDXGIAdapter *)adapter,
+                                         D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                                         D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                         NULL, 0, D3D11_SDK_VERSION,
+                                         &o->dev, &got, &o->ctx))) {
+                IDXGIOutput_Release(output);
+                continue;
+            }
+            /* IDXGIOutput5 arrived in Windows 10 1803; without it there is no
+               float duplication, only the 8-bit path. */
+            IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput5, (void **)&o->out5);
+            if (FAILED(IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1,
+                                                  (void **)&o->out1)) ||
+                !RecreateDup(o)) {
+                ReleaseOutput(o);
+                IDXGIOutput_Release(output);
+                continue;
+            }
+            IDXGIOutput_Release(output);
+            g_outCount++;
+        }
+        IDXGIAdapter1_Release(adapter);
+    }
+
+    IDXGIFactory1_Release(factory);
+    Log_Printf(L"capture: %d output(s), hdr=%d, sdr white %.0f nits",
+               g_outCount, (int)g_hdrMode, g_sdrWhiteNits);
+    return g_outCount > 0;
+}
+
+/*
+ * Called a little while after a snip. The staging texture is the largest thing
+ * capture holds - a full desktop of CPU-readable memory, 66 MB at 4K HDR - and
+ * it is only needed during a grab. The device and the duplication stay warm,
+ * so the next grab is as fast as before (measured: 21 ms either way).
+ *
+ * Call it twice, a couple of seconds apart: the driver frees a released
+ * texture asynchronously, and a trim straight after the release finds it still
+ * alive. Measured at 4K HDR: idle 115 MB after a snip without this, 51 MB with.
+ */
+void Capture_Idle(void)
+{
+    int i;
+    for (i = 0; i < g_outCount; i++) {
+        CapOutput *o = &g_out[i];
+        if (o->staging) {
+            ID3D11Texture2D_Release(o->staging);
+            o->staging = NULL;
+            o->stgW = o->stgH = 0;
+        }
+        TrimDevice(o);
+    }
+}
+
+void Capture_Shutdown(void)
+{
+    int i;
+    for (i = 0; i < g_outCount; i++)
+        ReleaseOutput(&g_out[i]);
+    g_outCount = 0;
+    g_inited   = FALSE;
+}
+
+const wchar_t *Capture_LastMethod(void)
+{
+    return g_method;
+}
+
+struct ID3D11Device *Capture_AcquireDevice(void)
+{
+    if (g_outCount < 1 || !g_out[0].dev)
+        return NULL;
+    ID3D11Device_AddRef(g_out[0].dev);
+    return g_out[0].dev;
+}
+
+BOOL Capture_VirtualDesktop(SnipImage *out, RECT *bounds)
+{
+    RECT vb;
+    int  i;
+    BOOL ok = TRUE;
+
+    vb.left   = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    vb.top    = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    vb.right  = vb.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    vb.bottom = vb.top  + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    /* HDR can be switched on or off at any moment, and it decides the pixel
+       format of every duplication object, so the machinery is rebuilt rather
+       than left describing a display state that no longer exists. */
+    if (!g_cfg.forceGdi) {
+        BOOL wantHdr = !g_cfg.forceSdr && Hdr_AnyDisplayActive();
+        BOOL lost    = FALSE;
+
+        /* An output whose duplication could not be recreated is dead until
+           everything is rebuilt; checking here means the snip in hand gets
+           the fast path back instead of quietly falling to GDI. */
+        for (i = 0; i < g_outCount; i++)
+            if (!g_out[i].dup)
+                lost = TRUE;
+
+        if (g_inited && (wantHdr != g_hdrMode || lost)) {
+            if (wantHdr != g_hdrMode)
+                Log_Printf(L"capture: advanced colour changed (%d -> %d), rebuilding",
+                           (int)g_hdrMode, (int)wantHdr);
+            else
+                Log_Printf(L"capture: a duplication was lost, rebuilding");
+            Capture_Shutdown();
+        }
+        Capture_Init();
+    }
+
+    if (!Snip_AllocImageEx(out, (UINT32)(vb.right - vb.left),
+                                (UINT32)(vb.bottom - vb.top),
+                                !g_cfg.forceGdi && g_hdrMode && g_outCount > 0))
+        return FALSE;
+    out->sdrWhiteNits = g_sdrWhiteNits;
+    if (bounds)
+        *bounds = vb;
+
+    /* One failing output invalidates the whole composite, so fall back
+       wholesale rather than shipping a half-black desktop. */
+    if (!g_cfg.forceGdi && g_outCount > 0) {
+        for (i = 0; i < g_outCount; i++) {
+            if (!BlitOutput(&g_out[i], out, &vb)) {
+                ok = FALSE;
+                break;
+            }
+        }
+        if (ok) {
+            g_method = out->hdr ? L"Desktop Duplication (HDR)"
+                                : L"Desktop Duplication";
+            return TRUE;
+        }
+        /*
+         * Something no longer matches - the desktop changed shape, an output
+         * went away, a mode switch is half done. GDI covers this snip; tearing
+         * the duplication down means the next one rebuilds it to fit the
+         * desktop as it now is, instead of every snip from here on taking the
+         * slow path.
+         */
+        Log_Printf(L"capture: duplication failed, GDI this time, rebuilding next");
+        Capture_Shutdown();
+    }
+
+    /* GDI has no floating-point path at all, so falling back also means
+       falling back to SDR - the image has to be reshaped for it. */
+    if (out->hdr) {
+        UINT32 w = out->width, h = out->height;
+        Snip_FreeImage(out);
+        if (!Snip_AllocImage(out, w, h))
+            return FALSE;
+    } else {
+        ZeroMemory(out->pixels, (SIZE_T)out->stride * out->height);
+        if (out->sdr10Pixels) {
+            HeapFree(GetProcessHeap(), 0, out->sdr10Pixels);
+            out->sdr10Pixels = NULL;
+            out->sdr10Stride = 0;
+            out->sdr10Valid = FALSE;
+        }
+    }
+
+    if (GrabViaGdi(out, &vb)) {
+        g_method = L"GDI";
+        return TRUE;
+    }
+
+    Snip_FreeImage(out);
+    return FALSE;
+}
+
+
+/* Draw the Windows cursor into a captured SDR frame. Draw into an opaque
+   24-bit DIB instead of the capture's BGRA surface: Desktop Duplication may
+   deliver an undefined/zero alpha byte, and GDI cursor composition against a
+   32-bit destination can make the cursor appear solid black on some drivers.
+   Only the small cursor rectangle is copied back, preserving frame alpha. */
+void Capture_DrawCursor(SnipImage *img, const RECT *bounds)
+{
+    CURSORINFO ci;
+    HDC screen = NULL, mem = NULL;
+    HBITMAP dib = NULL, old = NULL;
+    BYTE *bits = NULL;
+    BITMAPINFO bi;
+    ICONINFO ii;
+    BITMAP bm;
+    LONG x, y;
+    UINT32 row, col, cw, ch, dibStride;
+
+    if (!img || !img->pixels || img->hdr || img->bpp != 4 || !bounds)
+        return;
+    ZeroMemory(&ci, sizeof(ci));
+    ci.cbSize = sizeof(ci);
+    if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor)
+        return;
+
+    /* ptScreenPos is the cursor hotspot, so convert it to the image's top-left. */
+    x = ci.ptScreenPos.x - bounds->left;
+    y = ci.ptScreenPos.y - bounds->top;
+    ZeroMemory(&ii, sizeof(ii));
+    ZeroMemory(&bm, sizeof(bm));
+    cw = (UINT32)GetSystemMetrics(SM_CXCURSOR);
+    ch = (UINT32)GetSystemMetrics(SM_CYCURSOR);
+    if (GetIconInfo(ci.hCursor, &ii)) {
+        HBITMAP shape = ii.hbmColor ? ii.hbmColor : ii.hbmMask;
+        if (shape && GetObjectW(shape, (int)sizeof(bm), &bm) == (int)sizeof(bm)) {
+            if (bm.bmWidth > 0 && bm.bmWidth <= 1024)
+                cw = (UINT32)bm.bmWidth;
+            if (bm.bmHeight > 0 && bm.bmHeight <= 2048) {
+                LONG h = bm.bmHeight;
+                if (!ii.hbmColor) h /= 2; /* monochrome cursor mask stores AND/XOR rows */
+                if (h > 0 && h <= 1024) ch = (UINT32)h;
+            }
+        }
+        x -= (LONG)ii.xHotspot;
+        y -= (LONG)ii.yHotspot;
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    }
+    if (!cw || !ch || cw > 1024 || ch > 1024 ||
+        x >= (LONG)img->width || y >= (LONG)img->height ||
+        x + (LONG)cw <= 0 || y + (LONG)ch <= 0)
+        return;
+
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = (LONG)cw;
+    bi.bmiHeader.biHeight = -(LONG)ch; /* top-down */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 24;
+    bi.bmiHeader.biCompression = BI_RGB;
+    dibStride = (cw * 3u + 3u) & ~3u;
+
+    screen = GetDC(NULL);
+    mem = CreateCompatibleDC(screen);
+    if (mem)
+        dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+    if (dib && bits) {
+        /* Seed the local surface with underlying pixels so monochrome/XOR
+           cursors preserve their intended invert behaviour. */
+        for (row = 0; row < ch; ++row) {
+            BYTE *dst = bits + (SIZE_T)row * dibStride;
+            LONG sy = y + (LONG)row;
+            for (col = 0; col < cw; ++col) {
+                LONG sx = x + (LONG)col;
+                if (sx >= 0 && sy >= 0 && sx < (LONG)img->width && sy < (LONG)img->height) {
+                    const BYTE *src = img->pixels + (SIZE_T)sy * img->stride + (SIZE_T)sx * 4u;
+                    dst[col * 3u + 0u] = src[0];
+                    dst[col * 3u + 1u] = src[1];
+                    dst[col * 3u + 2u] = src[2];
+                } else {
+                    dst[col * 3u + 0u] = 0;
+                    dst[col * 3u + 1u] = 0;
+                    dst[col * 3u + 2u] = 0;
+                }
+            }
+        }
+
+        old = (HBITMAP)SelectObject(mem, dib);
+        if (old && old != (HBITMAP)HGDI_ERROR &&
+            DrawIconEx(mem, 0, 0, ci.hCursor, (int)cw, (int)ch, 0, NULL, DI_NORMAL)) {
+            for (row = 0; row < ch; ++row) {
+                LONG sy = y + (LONG)row;
+                const BYTE *src = bits + (SIZE_T)row * dibStride;
+                if (sy < 0 || sy >= (LONG)img->height) continue;
+                for (col = 0; col < cw; ++col) {
+                    LONG sx = x + (LONG)col;
+                    BYTE *dst;
+                    if (sx < 0 || sx >= (LONG)img->width) continue;
+                    dst = img->pixels + (SIZE_T)sy * img->stride + (SIZE_T)sx * 4u;
+                    dst[0] = src[col * 3u + 0u];
+                    dst[1] = src[col * 3u + 1u];
+                    dst[2] = src[col * 3u + 2u];
+                    /* Leave destination alpha untouched. */
+                }
+            }
+        }
+        if (old && old != (HBITMAP)HGDI_ERROR)
+            SelectObject(mem, old);
+    }
+    if (dib) DeleteObject(dib);
+    if (mem) DeleteDC(mem);
+    if (screen) ReleaseDC(NULL, screen);
+}
